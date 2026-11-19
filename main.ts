@@ -1,104 +1,160 @@
-// The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
-// port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
-// the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
+// Boot file for the forge. Everything here exists to introduce this process
+// to the grading environment and to keep it alive until that environment
+// has finished with it.
 //
-//   1. MAKEFUN_ENV_URL names the env's origin (http://store:8080 in a trial container). Without it
-//      there is nothing to talk to, so the program exits 1 at once.
-//   2. Create the server and listen(0): the kernel picks a free port. Never bind 8080 — the env owns it.
-//   3. POST $MAKEFUN_ENV_URL/register {"port": N}. The env records the address the request came from
-//      plus N as your base URL and dials it from then on. The first register wins; a 409 means another
-//      entry already registered, and this process keeps waiting like any other.
-//   4. GET $MAKEFUN_ENV_URL/done until the body is {"done": true}. The env answers at once ({"done":
-//      false} while the suite runs), so this is a poll, not a long-held request. A failed or slow poll
-//      is retried with a short exponential backoff; the process never exits before the env says done.
-//   5. Close the server and exit 0. The harness then stops the env, which writes the export the scorer
-//      reads.
+// The environment (the "env") is a separate program, and it cannot guess
+// where this server ended up listening: the port is only picked by the
+// operating system at listen time. So the first job after binding is to
+// report the port back:
 //
-// main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+//   - MAKEFUN_ENV_URL holds the env's origin. Without it there is nobody
+//     to report to, and the process exits 1 straight away.
+//   - The forge built by app.ts is bound to port 0, an ephemeral port.
+//     The env's own port is never touched; the env is sitting on it.
+//   - A POST to /register carrying {"port": N} as JSON tells the env
+//     where the trial's traffic should go. 200 means the address was
+//     taken. 409 means another process registered first, which is not
+//     this process's problem: it just carries on waiting like the rest.
+//     400 and 405 mean the request itself broke the contract, and no
+//     amount of retrying repairs that, so those end the program.
+//   - GET /done is polled from then on. It answers {"done": false} while
+//     the trial runs and {"done": true} once the env has written its
+//     export; on that answer the listener closes and the process exits 0.
+//
+// Settings the forge itself cares about (the trial clock, the shop token,
+// the seed) are read inside app.ts. This file needs only the env's origin.
 
 import { createApp } from './app.ts';
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (ENV_URL === '') {
-  process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
-  process.exit(1);
-}
+/** An answer from the env that waiting and asking again will never fix. */
+class HopelessAnswerError extends Error {}
 
-/** How long one register or done request may take before it is abandoned and retried. */
-const REQUEST_TIMEOUT_MS = 30_000;
-/** The first wait between retries, and the longest. */
-const RETRY_INITIAL_MS = 250;
-const RETRY_MAX_MS = 2_000;
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
-function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
+/** Sleep for the given number of milliseconds. */
+function nap(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 /**
- * POST the bound port until the env accepts it. 200 is the normal answer; 409 means a first register
- * already won, which is not this process's to fix. 400 and 405 are contract errors and end the program;
- * a network error or another status is retried, since the env may still be starting.
+ * How long to wait before trying again, given the number of failures so
+ * far: a fifth of a second at first, doubling with each failure, and
+ * never more than a second and a half.
  */
-async function register(port: number): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+function delayAfter(failures: number): number {
+  return Math.min(1500, 200 * 2 ** Math.min(failures, 6));
+}
+
+/** One call to the env, abandoned if it has not answered within 15 seconds. */
+function callEnv(origin: string, path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${origin}${path}`, { ...init, signal: AbortSignal.timeout(15_000) });
+}
+
+/**
+ * POST our port to the env until it accepts the registration. Refused
+ * connections, timeouts and 5xx answers only mean the env may still be
+ * starting, so they are retried after a pause; the two hopeless statuses
+ * are the only way out besides success.
+ */
+async function announcePort(origin: string, port: number): Promise<void> {
+  let failures = 0;
+  for (;;) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
+      const reply = await callEnv(origin, '/register', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
+      const detail = await reply.text().catch(() => '');
+      if (reply.status === 200 || reply.status === 409) return;
+      if (reply.status === 400 || reply.status === 405) {
+        throw new HopelessAnswerError(`register was refused with HTTP ${reply.status}: ${detail}`);
+      }
     } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
+      if (err instanceof HopelessAnswerError) throw err;
+      // A network-level failure says nothing about the contract; retry.
     }
-    await sleep(retryDelay(attempt));
+    failures += 1;
+    await nap(delayAfter(failures));
   }
 }
 
-/** Poll GET /done until it answers {"done":true}; never return before that. */
-async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+/**
+ * Ask the env whether the trial is over, again and again, until it says
+ * so. A garbled body, a non-200 answer or a call that never lands all
+ * mean the same thing: not over yet.
+ */
+async function awaitTrialEnd(origin: string): Promise<void> {
+  let failures = 0;
+  for (;;) {
+    let finished = false;
     try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
+      const reply = await callEnv(origin, '/done');
+      if (reply.ok) {
+        const payload: unknown = await reply.json();
+        finished =
+          typeof payload === 'object' &&
+          payload !== null &&
+          (payload as { done?: unknown }).done === true;
+      } else {
+        await reply.text().catch(() => undefined);
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      finished = false;
     }
-    await sleep(retryDelay(attempt));
+    if (finished) return;
+    failures += 1;
+    await nap(delayAfter(failures));
   }
 }
 
-/** Bound the port, register it, then wait for the env: the whole life of the process. */
-async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
+/** Stop listening; if connections linger, stop waiting after two seconds. */
+function stopListening(server: ReturnType<typeof createApp>): Promise<void> {
+  return new Promise((resolve) => {
+    const deadline = setTimeout(resolve, 2000);
+    server.close(() => {
+      clearTimeout(deadline);
+      resolve();
+    });
+    server.closeIdleConnections();
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
-
-  await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
-
-  await waitForDone();
-  server.close();
-  process.stdout.write('[entry] done\n');
 }
 
-try {
-  await main();
-  process.exit(0);
-} catch (err) {
-  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
+/** The whole life of the process: bind, announce, wait, shut down. */
+async function run(origin: string): Promise<void> {
+  const forge = createApp();
+  await new Promise<void>((resolve, reject) => {
+    forge.once('error', reject);
+    forge.listen(0, () => {
+      resolve();
+    });
+  });
+  const bound = forge.address();
+  if (bound === null || typeof bound !== 'object') {
+    throw new Error('listening did not produce a TCP port to announce');
+  }
+  console.log(`[forge] listening on port ${bound.port}`);
+
+  await announcePort(origin, bound.port);
+  console.log('[forge] the env knows where we are; standing by for the end of the trial');
+
+  await awaitTrialEnd(origin);
+  await stopListening(forge);
+  console.log('[forge] trial over; goodbye');
+}
+
+const origin = (process.env.MAKEFUN_ENV_URL ?? '').trim().replace(/\/+$/, '');
+if (origin === '') {
+  console.error('[forge] MAKEFUN_ENV_URL is not set, so there is no env to register with; exiting');
   process.exit(1);
 }
+
+run(origin).then(
+  () => {
+    process.exit(0);
+  },
+  (err: unknown) => {
+    console.error(`[forge] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  },
+);
